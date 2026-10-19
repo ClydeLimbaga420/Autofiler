@@ -1,19 +1,27 @@
 """
 main.py
 
-Windows File Explorer: hover over a file to see which formats it can be
-converted to. Also adds "Convert to ..." right-click entries.
+Windows File Explorer: hover over a file and a radial "wheel" pops up around
+the cursor showing the formats it can be converted to. Click a slice to convert.
 
-Run install/uninstall from an ADMIN terminal:
-    python main.py install
-    python main.py uninstall
-    python main.py convert <file> <.ext>     (used by the right-click menu)
+Also supports (optional) a plain hover tooltip and right-click "Convert to ..."
+entries.
+
+Commands:
+    python main.py wheel                run the hover wheel (leave it running)
+    python main.py startup              start the wheel automatically at sign-in
+    python main.py unstartup            remove the auto-start entry
+    python main.py install              (admin) tooltip text + right-click entries
+    python main.py uninstall            (admin) remove the above
+    python main.py convert <file> <.ext>
 """
 import csv
 import ctypes
 import json
+import math
 import os
 import sys
+import time
 
 # --------------------------------------------------------------------------
 # Conversion map: source extension -> list of target extensions
@@ -31,6 +39,21 @@ SUPPORTED_SOURCES = sorted(CONVERSIONS.keys())
 
 MARKER = "FileConvertTip_Installed"
 BACKUP = "FileConvertTip_Backup"
+
+# --------------------------------------------------------------------------
+# Wheel settings
+# --------------------------------------------------------------------------
+WHEEL_DWELL_MS = 700        # how long the mouse must rest on a file
+WHEEL_REQUIRE_KEY = None    # None = hover only. Or 0x10 Shift, 0x11 Ctrl, 0x12 Alt (hold while hovering)
+WHEEL_POLL_MS = 80
+WHEEL_R_OUT = 150
+WHEEL_R_IN = 55
+WHEEL_TRANSPARENT = "#010101"
+WHEEL_COLOR = "#2b2f3a"
+WHEEL_COLOR_HOVER = "#4f7cff"
+WHEEL_COLOR_CENTER = "#1b1e27"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "FileConvertWheel"
 
 
 def tooltip_text(ext):
@@ -91,7 +114,240 @@ def convert(src, target_ext):
 
 
 # --------------------------------------------------------------------------
-# Install / uninstall (registry only, no COM needed)
+# Hover wheel
+# --------------------------------------------------------------------------
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _cursor_pos():
+    pt = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def _key_down(vk):
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def _file_under_cursor(x, y):
+    """Return the full path of the Explorer file under (x, y), or None."""
+    import uiautomation as auto
+    import win32com.client
+
+    ctrl = auto.ControlFromPoint(x, y)
+    item = ctrl
+    for _ in range(4):
+        if item is None:
+            return None
+        if item.ControlTypeName == "ListItemControl":
+            break
+        item = item.GetParentControl()
+    else:
+        return None
+    if item is None or item.ControlTypeName != "ListItemControl":
+        return None
+
+    top = item.GetTopLevelControl()
+    if top is None or top.ClassName != "CabinetWClass":
+        return None
+    hwnd = top.NativeWindowHandle
+    name = item.Name
+
+    shell_app = win32com.client.Dispatch("Shell.Application")
+    for w in shell_app.Windows():
+        try:
+            if w.HWND != hwnd:
+                continue
+            folder = w.Document.Folder
+            for it in folder.Items():
+                if it.IsFolder:
+                    continue
+                if it.Name == name or os.path.basename(it.Path) == name:
+                    return it.Path
+        except Exception:
+            continue
+    return None
+
+
+class ConvertWheel:
+    """Borderless radial menu centred on the cursor."""
+
+    def __init__(self, root, path, cx, cy, on_pick, on_close):
+        import tkinter as tk
+        self.tk = tk
+        self.root = root
+        self.path = path
+        self.on_pick = on_pick
+        self.on_close = on_close
+        self.targets = CONVERSIONS[os.path.splitext(path)[1].lower()]
+        self.step = 360.0 / len(self.targets)
+        self.hover = -1
+        self.closed = False
+
+        self.size = WHEEL_R_OUT * 2 + 20
+        self.c = self.size // 2
+        self.screen_cx, self.screen_cy = cx, cy
+
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-transparentcolor", WHEEL_TRANSPARENT)
+        self.win.configure(bg=WHEEL_TRANSPARENT)
+        self.win.geometry(f"{self.size}x{self.size}+{cx - self.c}+{cy - self.c}")
+
+        self.canvas = tk.Canvas(self.win, width=self.size, height=self.size,
+                                bg=WHEEL_TRANSPARENT, highlightthickness=0)
+        self.canvas.pack()
+
+        self.arcs = []
+        for i, target in enumerate(self.targets):
+            start = 90 - (i + 1) * self.step
+            arc = self.canvas.create_arc(
+                self.c - WHEEL_R_OUT, self.c - WHEEL_R_OUT,
+                self.c + WHEEL_R_OUT, self.c + WHEEL_R_OUT,
+                start=start, extent=self.step, fill=WHEEL_COLOR,
+                outline=WHEEL_COLOR_CENTER, width=2, style=tk.PIESLICE)
+            self.arcs.append(arc)
+
+        self.canvas.create_oval(self.c - WHEEL_R_IN, self.c - WHEEL_R_IN,
+                                self.c + WHEEL_R_IN, self.c + WHEEL_R_IN,
+                                fill=WHEEL_COLOR_CENTER, outline="")
+
+        r_text = (WHEEL_R_OUT + WHEEL_R_IN) / 2
+        for i, target in enumerate(self.targets):
+            mid = math.radians((i + 0.5) * self.step)
+            self.canvas.create_text(self.c + r_text * math.sin(mid),
+                                    self.c - r_text * math.cos(mid),
+                                    text=target.lstrip(".").upper(),
+                                    fill="white", font=("Segoe UI", 10, "bold"))
+
+        name = os.path.basename(path)
+        if len(name) > 22:
+            name = name[:19] + "..."
+        self.canvas.create_text(self.c, self.c, text=name, fill="#cfd6e4",
+                                width=WHEEL_R_IN * 1.6, font=("Segoe UI", 8), justify="center")
+
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.win.bind("<Escape>", lambda e: self.close())
+        self.win.focus_force()
+        self.win.after(WHEEL_POLL_MS, self._watch)
+
+    def _hit(self, mx, my):
+        dx, dy = mx - self.c, my - self.c
+        r = math.hypot(dx, dy)
+        if r < WHEEL_R_IN or r > WHEEL_R_OUT:
+            return -1
+        ang = math.degrees(math.atan2(dx, -dy)) % 360
+        return min(int(ang // self.step), len(self.targets) - 1)
+
+    def _on_motion(self, event):
+        idx = self._hit(event.x, event.y)
+        if idx != self.hover:
+            if self.hover >= 0:
+                self.canvas.itemconfig(self.arcs[self.hover], fill=WHEEL_COLOR)
+            if idx >= 0:
+                self.canvas.itemconfig(self.arcs[idx], fill=WHEEL_COLOR_HOVER)
+            self.hover = idx
+
+    def _on_click(self, event):
+        idx = self._hit(event.x, event.y)
+        self.close()
+        if idx >= 0:
+            self.on_pick(self.path, self.targets[idx])
+
+    def _watch(self):
+        if self.closed:
+            return
+        x, y = _cursor_pos()
+        dist = math.hypot(x - self.screen_cx, y - self.screen_cy)
+        if dist > WHEEL_R_OUT + 40:
+            self.close()
+            return
+        self.win.after(WHEEL_POLL_MS, self._watch)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self.on_close()
+
+
+def _toast(root, text, x, y):
+    import tkinter as tk
+    t = tk.Toplevel(root)
+    t.overrideredirect(True)
+    t.attributes("-topmost", True)
+    tk.Label(t, text=text, bg=WHEEL_COLOR_CENTER, fg="white",
+             font=("Segoe UI", 10), padx=14, pady=8).pack()
+    t.geometry(f"+{x + 12}+{y + 12}")
+    t.after(2200, t.destroy)
+
+
+def run_wheel():
+    import tkinter as tk
+    try:
+        import uiautomation  # noqa: F401
+        import win32com.client  # noqa: F401
+    except ImportError:
+        print("Missing packages. Run: pip install -r requirements.txt")
+        sys.exit(1)
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+
+    root = tk.Tk()
+    root.withdraw()
+    state = {"pos": _cursor_pos(), "since": time.time(), "handled": False, "wheel": None}
+
+    def on_close():
+        state["wheel"] = None
+
+    def on_pick(path, target):
+        x, y = _cursor_pos()
+        try:
+            out = convert(path, target)
+            _toast(root, f"Saved: {os.path.basename(out)}", x, y)
+        except Exception as e:
+            ctypes.windll.user32.MessageBoxW(0, str(e), "Conversion failed", 0x10)
+
+    def tick():
+        try:
+            x, y = _cursor_pos()
+            px, py = state["pos"]
+            if abs(x - px) > 3 or abs(y - py) > 3:
+                state["pos"] = (x, y)
+                state["since"] = time.time()
+                state["handled"] = False
+            elif (state["wheel"] is None and not state["handled"]
+                  and (time.time() - state["since"]) * 1000 >= WHEEL_DWELL_MS
+                  and not _key_down(0x01)
+                  and (WHEEL_REQUIRE_KEY is None or _key_down(WHEEL_REQUIRE_KEY))):
+                state["handled"] = True
+                path = _file_under_cursor(x, y)
+                if path and os.path.splitext(path)[1].lower() in CONVERSIONS:
+                    state["wheel"] = ConvertWheel(root, path, x, y, on_pick, on_close)
+        except Exception as e:
+            print(f"watcher error: {e}")
+        root.after(WHEEL_POLL_MS, tick)
+
+    print("Wheel running. Hover over a file in File Explorer. Ctrl+C to stop.")
+    root.after(WHEEL_POLL_MS, tick)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Auto-start (current user, no admin needed)
 # --------------------------------------------------------------------------
 def _pythonw():
     exe = sys.executable
@@ -100,6 +356,27 @@ def _pythonw():
     return exe
 
 
+def startup():
+    import winreg
+    script = os.path.abspath(__file__)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, f'"{_pythonw()}" "{script}" wheel')
+    print("The wheel will start automatically when you sign in.")
+
+
+def unstartup():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, RUN_NAME)
+    except FileNotFoundError:
+        pass
+    print("Auto-start removed.")
+
+
+# --------------------------------------------------------------------------
+# Install / uninstall (registry tooltip + right-click entries, needs admin)
+# --------------------------------------------------------------------------
 def _notify_shell():
     # SHCNE_ASSOCCHANGED = 0x08000000, SHCNF_IDLIST = 0
     ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
@@ -208,7 +485,13 @@ def main():
         print(__doc__)
         return
     cmd = sys.argv[1].lower()
-    if cmd == "install":
+    if cmd == "wheel":
+        run_wheel()
+    elif cmd == "startup":
+        startup()
+    elif cmd == "unstartup":
+        unstartup()
+    elif cmd == "install":
         install()
     elif cmd == "uninstall":
         uninstall()
